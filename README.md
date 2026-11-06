@@ -1,5 +1,7 @@
 # ASUS-Battery-Limiter
 
+[![CI](https://github.com/Peocold/ASUS-Battery-Limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/Peocold/ASUS-Battery-Limiter/actions/workflows/ci.yml)
+
 在 Linux 下为 ASUS 笔记本启用**电池充电上限**（如 80%），并在开机、睡眠唤醒后自动维持。无需 asusctl / TLP，也不依赖任何第三方守护进程。
 
 同时修复一个 Ubuntu 22.04（内核 6.8 HWE）上的具体 bug：`amd_pmf` 抢先注册 ACPI `platform_profile`，导致 `asus-wmi` 探针以 `-EEXIST` 失败，`/sys/class/power_supply/BAT0/charge_control_end_threshold` 根本不出现——这时 asusctl、TLP、手写 udev 规则全都无效，因为它们只是往一个不存在的文件写值。

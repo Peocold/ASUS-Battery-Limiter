@@ -1,5 +1,7 @@
 # ASUS-Battery-Limiter
 
+[![CI](https://github.com/Peocold/ASUS-Battery-Limiter/actions/workflows/ci.yml/badge.svg)](https://github.com/Peocold/ASUS-Battery-Limiter/actions/workflows/ci.yml)
+
 Battery charge-limit control for ASUS laptops on Linux: set a maximum charge level (e.g. 80%) and keep it applied across boots, suspend and hibernate cycles. No asusctl, no TLP, no background daemon.
 
 It also works around a specific Ubuntu 22.04 / kernel 6.8 (HWE) bug: `amd_pmf` registers the ACPI `platform_profile` first, so the `asus-wmi` probe fails with `-EEXIST`, and `/sys/class/power_supply/BAT0/charge_control_end_threshold` never appears. In that state asusctl, TLP and any udev rule are useless, because they only write to a file that does not exist.
