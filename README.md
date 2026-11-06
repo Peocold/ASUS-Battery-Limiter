@@ -103,7 +103,6 @@ WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target
 
 - **电量高于上限时插电**：`status` 变为 `Not charging`，`power_now = 0`，电脑由适配器供电，电池不充电（不会“补到 100”）。
 - **电量低于上限时插电**：充到 80% 后转为 `Not charging`。
-- 华硕 EC 通常有约 5% 回差：掉到 ~75% 才会再补到 80%，所以 78~80% 的小幅波动是正常的。
 - 阈值只管“充”不管“放”，不会为了让电量降到 80% 而主动放电。
 
 需要满电出门时：
