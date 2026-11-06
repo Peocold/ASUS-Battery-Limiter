@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n asus-battery-limit tests/test.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning -x asus-battery-limit tests/test.sh
+
+      - name: Offline tests
+        run: ./tests/test.sh
