@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# asus-battery-limit —— 华硕笔记本电池充电上限管理
+#
+# 原理: 内核 asus-wmi 驱动为 BAT0 暴露
+#   /sys/class/power_supply/BAT0/charge_control_end_threshold
+# 写入 40-100 即调用 ASUS WMI (DEVID_RSOC 0x00120057) 设置最大充电百分比,
+# 由 EC 保持; 写 100 = 关闭保护。
+#
+# 子命令:
+#   status                 查看当前上限/电量
+#   set <pct>              立即设置上限 (40-100)
+#   install [pct]          安装 systemd 服务, 开机与每次唤醒后自动应用 (默认 80)
+#   uninstall              卸载服务
+#   diagnose               诊断为什么节点不存在
+#   try-now                运行时卸载 amd_pmf 并重载 asus 驱动, 立即验证 (需 root, 不必重启)
+#   fix-kernel-conflict    永久屏蔽 amd_pmf (写入 modprobe.d, 需重启)
+#   revert-kernel-conflict 撤销上面的屏蔽
+#
+# 环境变量:
+#   ASUS_BAT_SYSFS  覆盖 /sys/class/power_supply (测试用)
+#   DEFAULT_LIMIT   覆盖 install 的默认上限 (默认 80)
+
+set -euo pipefail
+
+VERSION="1.0"
+SYSFS="${ASUS_BAT_SYSFS:-/sys/class/power_supply}"
+UNIT_NAME="asus-battery-limit.service"
+UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
+CONF_PATH="/etc/modprobe.d/zz-asus-battery-limit.conf"
+INSTALL_PATH="/usr/local/sbin/asus-battery-limit"
+SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+DEFAULT_LIMIT="${DEFAULT_LIMIT:-80}"
+MIN_LIMIT=40
+MAX_LIMIT=100
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '警告: %s\n' "$*" >&2; }
+die()  { printf '错误: %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+	# 测试钩子: 指向假 sysfs 时跳过 root 检查, 便于验证逻辑
+	[ -n "${ASUS_BAT_SYSFS:-}" ] && return 0
+	if [ "$(id -u)" -ne 0 ]; then
+		die "需要 root 权限, 请用: sudo $0 $*"
+	fi
+}
+
+usage() {
+	awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$SELF_PATH"
+}
+
+# 找到带 charge_control_end_threshold 的电池目录
+find_battery() {
+	local d
+	for d in "$SYSFS"/BAT*; do
+		[ -d "$d" ] || continue
+		if [ -e "$d/charge_control_end_threshold" ]; then
+			printf '%s\n' "$d"
+			return 0
+		fi
+	done
+	return 1
+}
+
+read_attr() {
+	[ -r "$1" ] && cat "$1" 2>/dev/null || printf '?'
+}
+
+# 内核日志: dmesg 可能被 dmesg_restrict 限制, 回落到 journalctl -k
+kernel_log() {
+	local out
+	out="$(dmesg 2>/dev/null || true)"
+	[ -n "$out" ] || out="$(journalctl -k -b --no-pager 2>/dev/null || true)"
+	printf '%s\n' "$out"
+}
+
+validate_limit() {
+	local v="$1"
+	[[ "$v" =~ ^[0-9]{1,3}$ ]] || die "上限必须是 0-100 的整数, 收到: $v"
+	if (( v < MIN_LIMIT || v > MAX_LIMIT )); then
+		die "上限必须在 ${MIN_LIMIT}-${MAX_LIMIT} 之间 (过低可能导致无法充电; 100 = 关闭保护)"
+	fi
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+	local bat limit cap state design full
+	if ! bat="$(find_battery)"; then
+		say "未找到 charge_control_end_threshold 节点。"
+		say "这台机器的内核没有暴露充电上限接口, 请运行:  $0 diagnose"
+		return 1
+	fi
+
+	limit="$(read_attr "$bat/charge_control_end_threshold")"
+	cap="$(read_attr "$bat/capacity")"
+	state="$(read_attr "$bat/status")"
+	design="$(read_attr "$bat/energy_full_design")"
+	full="$(read_attr "$bat/energy_full")"
+
+	say "电池设备    : ${bat}"
+	say "充电上限    : ${limit}%"
+	say "当前电量    : ${cap}%  (${state})"
+	if [[ "$design" =~ ^[0-9]+$ && "$full" =~ ^[0-9]+$ && "$design" -gt 0 ]]; then
+		awk -v d="$design" -v f="$full" 'BEGIN{printf "设计/满充   : %.1f Wh / %.1f Wh  (健康度 %.1f%%)\n", d/1e6, f/1e6, 100*f/d}'
+	fi
+	if [ "$limit" = "100" ] && [ "$state" = "Charging" ]; then
+		say "提示        : 上限已关闭, 会一直充到 100%。设置保护:  sudo $0 set 80"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- set
+
+cmd_set() {
+	local v="${1:-}" bat cur
+	validate_limit "$v"
+	need_root set "$v"
+
+	bat="$(find_battery)" || die "节点不存在。先运行 '$0 diagnose', 或 '$0 try-now' 验证。"
+
+	printf '%s\n' "$v" > "$bat/charge_control_end_threshold" || \
+		die "写入失败。若报 Input/output error 或 Invalid argument, 说明该机型 WMI 拒绝了 RSOC 调用。"
+
+	cur=""
+	for _ in 1 2 3 4 5; do
+		cur="$(read_attr "$bat/charge_control_end_threshold")"
+		[ "$cur" = "$v" ] && break
+		sleep 0.2
+	done
+	[ "$cur" = "$v" ] || die "写入后读回不一致 (期望 $v, 实际 $cur)"
+
+	if [ "$v" = "100" ]; then
+		say "已关闭充电上限 (100%)。"
+	else
+		say "已将充电上限设为 ${v}%。"
+		say "注意: 该值由 EC 保持, 但断电/换电池后可能复位为 100%。"
+		say "建议安装开机服务:  sudo $0 install $v"
+	fi
+}
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+	local limit="${1:-$DEFAULT_LIMIT}"
+	validate_limit "$limit"
+	need_root install "$limit"
+
+	find_battery >/dev/null || die "当前内核没有该节点, 无法安装。先运行: sudo $0 try-now"
+
+	install -m 0755 "$SELF_PATH" "$INSTALL_PATH"
+
+	cat > "$UNIT_PATH" <<EOF
+[Unit]
+Description=ASUS battery charge limit (${limit}%)
+Documentation=file://${INSTALL_PATH}
+After=suspend.target hibernate.target hybrid-sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=${INSTALL_PATH} set ${limit}
+EOF
+
+	cat >> "$UNIT_PATH" <<'EOF'
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target
+EOF
+
+	systemctl daemon-reload
+	systemctl enable "$UNIT_NAME" >/dev/null
+	systemctl start "$UNIT_NAME" || warn "服务立即启动失败, 请查看: journalctl -u $UNIT_NAME"
+
+	say "已安装 ${UNIT_PATH} (上限 ${limit}%, 开机与唤醒后自动应用)。"
+	say "查看状态: systemctl status $UNIT_NAME;  日志: journalctl -u $UNIT_NAME"
+}
+
+cmd_uninstall() {
+	need_root uninstall
+	systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
+	rm -f "$UNIT_PATH"
+	systemctl daemon-reload
+	systemctl reset-failed "$UNIT_NAME" 2>/dev/null || true
+	rm -f "$INSTALL_PATH"
+	say "已卸载开机服务。当前充电上限仍保持 (如需恢复: sudo $0 set 100)。"
+}
+
+# ---------------------------------------------------------------- diagnose
+
+cmd_diagnose() {
+	local bat log
+	say "==================== 诊断报告 ===================="
+	say "机型      : $(read_attr /sys/class/dmi/id/sys_vendor) $(read_attr /sys/class/dmi/id/product_name)"
+	say "主板      : $(read_attr /sys/class/dmi/id/board_name)"
+	say "内核      : $(uname -r)"
+	say "发行版    : $( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-?}" )"
+	say ""
+
+	say "-- 电源设备 --"
+	local d
+	for d in "$SYSFS"/*; do
+		[ -d "$d" ] && say "  ${d##*/}"
+	done
+	say ""
+
+	if bat="$(find_battery)"; then
+		say "-- 充电上限: 可用 --"
+		say "  节点   : $bat/charge_control_end_threshold"
+		say "  当前值 : $(read_attr "$bat/charge_control_end_threshold")%"
+		say "  结论   : 内核已暴露接口, 可直接 '$0 set 80' 或 '$0 install 80'。"
+		return 0
+	fi
+
+	say "-- 充电上限: 节点不存在 --"
+	say ""
+
+	log="$(kernel_log)"
+
+	say "-- asus-wmi 探针 --"
+	if [ -n "$log" ]; then
+		printf '%s\n' "$log" | grep -Ei 'asus[-_a-z]*wmi' | awk 'length($0) < 200' | tail -n 8 | sed 's/^/  /' || true
+	else
+		say "  (读不到内核日志, 可试 sudo dmesg)"
+	fi
+	say ""
+
+	say "-- amd_pmf --"
+	if [ -n "$log" ]; then
+		printf '%s\n' "$log" | grep -Ei 'amd[-_]pmf' | awk 'length($0) < 200' | tail -n 5 | sed 's/^/  /' || true
+	fi
+	[ -d /sys/bus/platform/drivers/amd-pmf/AMDI0102:00 ] && say "  已绑定 AMDI0102:00, 已注册 platform_profile"
+	say ""
+
+	say "-- platform_profile --"
+	if [ -e /sys/firmware/acpi/platform_profile ]; then
+		say "  /sys/firmware/acpi/platform_profile = $(cat /sys/firmware/acpi/platform_profile 2>/dev/null)  (已被占用)"
+	else
+		say "  不存在 (没有别的驱动占用)"
+	fi
+	say ""
+
+	if [ -n "$log" ] && printf '%s\n' "$log" | grep -q 'asus-nb-wmi: probe of asus-nb-wmi failed with error -17'; then
+		say "结论: 已定位。"
+		say "  amd_pmf 先把 ACPI platform_profile 注册走了, asus-wmi 再注册同一接口就得到"
+		say "  -EEXIST(-17), 于是 asus_wmi_add() 提前返回, 后面的 asus_wmi_battery_init()"
+		say "  没有执行 —— BAT0 因此没有 charge_control_end_threshold。asusctl / TLP 只是"
+		say "  往这个节点写值, 所以必然失败。Ubuntu 22.04 的 6.8 内核尚未回合上游 6.12 的修复。"
+		say "  另外本机 amd_pmf 自己报告 'PMF Smart PC not advertised in BIOS', 说明屏蔽它"
+		say "  几乎没有功能损失, 只丢掉 platform_profile 的三档预设。"
+		say ""
+		say "处理:"
+		say "  sudo $0 try-now              # 立即验证 (卸载 amd_pmf 并重载驱动, 不必重启)"
+		say "  sudo $0 fix-kernel-conflict  # 永久修复 (屏蔽 amd_pmf, 重启后生效)"
+		say "  sudo $0 install 80           # 修好后安装开机/唤醒自动应用"
+	else
+		say "结论: 未发现已知的 -17 冲突; 请把上面的日志发出来进一步判断。"
+	fi
+}
+
+# ---------------------------------------------------------------- try-now
+
+cmd_try_now() {
+	need_root try-now
+	if find_battery >/dev/null; then
+		say "节点已存在, 无需 try-now: $(find_battery)/charge_control_end_threshold"
+		return 0
+	fi
+
+	say "警告: 会短暂卸载 asus 驱动 (可能闪一下背光/热键, 不影响会话)。"
+	say "[1/4] 卸载 amd_pmf ..."
+	modprobe -r amd_pmf 2>/dev/null || true
+	if [ -d /sys/module/amd_pmf ]; then
+		warn "amd_pmf 仍在内核中 (被占用?), 在线验证无法进行。"
+		say "请直接走永久方案:  sudo $0 fix-kernel-conflict && sudo reboot"
+		return 1
+	fi
+	say "[2/4] 卸载触发 probe 的 asus_nb_wmi ..."
+	# 真正触发 probe 的是 asus_nb_wmi 的 module_init -> asus_wmi_register_driver()。
+	# asus_wmi 本身只是通用代码 (它的 module_init 是空的), 不需要卸载;
+	# 它常被 mfd_aaeon 持有, 强行卸载既没必要也会失败。
+	modprobe -r asus_nb_wmi 2>/dev/null || true
+	if [ -d /sys/module/asus_nb_wmi ]; then
+		warn "asus_nb_wmi 未能卸载, 在线验证无法进行。"
+		say "请直接走永久方案:  sudo $0 fix-kernel-conflict && sudo reboot"
+		return 1
+	fi
+	sleep 1
+	say "[3/4] 重新加载 asus_nb_wmi ..."
+	modprobe asus_nb_wmi || die "加载 asus_nb_wmi 失败"
+	for _ in 1 2 3 4 5; do
+		find_battery >/dev/null && break
+		sleep 1
+	done
+	say "[4/4] 检查节点 ..."
+
+	if find_battery >/dev/null; then
+		say "成功: $(find_battery)/charge_control_end_threshold 出现, 当前 $(read_attr "$(find_battery)/charge_control_end_threshold")%"
+		say "现在即可: sudo $0 set 80"
+		say "要永久生效: sudo $0 fix-kernel-conflict 然后重启"
+		return 0
+	fi
+
+	warn "重载驱动后仍无节点。"
+	if kernel_log | grep -q 'asus-nb-wmi: probe of asus-nb-wmi failed with error -17'; then
+		warn "驱动仍因 -EEXIST(-17) 失败: platform_profile 还被别的模块占着。"
+		say "请重启后再试一次, 或把下面日志发出来。"
+	else
+		say "说明该机型 WMI 未报告 RSOC(0x00120057) 支持, 需要驱动层面的适配, 不是脚本能解决的。"
+	fi
+	kernel_log | grep -Ei 'asus[-_a-z]*wmi' | awk 'length($0) < 200' | tail -n 10 | sed 's/^/  /' || true
+	return 1
+}
+
+# ---------------------------------------------------------------- fix / revert
+
+cmd_fix() {
+	need_root fix-kernel-conflict
+	if find_battery >/dev/null; then
+		say "注意: 当前节点已存在 (刚才 try-now 临时卸载了 amd_pmf 的效果)。"
+		say "      重启后 amd_pmf 会重新加载, 节点会消失, 所以仍需写入 blacklist。"
+	fi
+
+	cat > "$CONF_PATH" <<'EOF'
+# 由 asus-battery-limit fix-kernel-conflict 生成。
+# 原因: amd_pmf 先占用 ACPI platform_profile, 使 asus-wmi 探针以 -EEXIST(-17) 失败,
+# 导致 asus_wmi_battery_init() 不执行, BAT0 缺少 charge_control_end_threshold。
+# 删除本文件并重启即可恢复 amd_pmf。
+blacklist amd_pmf
+EOF
+
+	update-initramfs -u -k all >/dev/null 2>&1 || warn "update-initramfs 失败 (通常无碍, blacklist 运行时即生效)"
+
+	say "已写入 $CONF_PATH:"
+	sed 's/^/  /' "$CONF_PATH" | tail -n 5
+	say "重启后 amd_pmf 不再加载, asus-wmi 接管 platform_profile 并注册充电上限节点。"
+	say ""
+	say "代价: 不再有 AMD PMF 的自动电源策略, 平台配置文件档位由"
+	say "      low-power/balanced/performance 变为 quiet/balanced/performance。"
+	say "验证: 重启后运行  $0 status"
+	say "回滚: sudo $0 revert-kernel-conflict 然后重启"
+}
+
+cmd_revert() {
+	need_root revert-kernel-conflict
+	rm -f "$CONF_PATH"
+	update-initramfs -u -k all >/dev/null 2>&1 || true
+	say "已移除 $CONF_PATH, 重启后恢复 amd_pmf (充电上限节点会再次消失)。"
+}
+
+# ---------------------------------------------------------------- main
+
+case "${1:-help}" in
+	status)                 shift; cmd_status "$@" ;;
+	set)                    shift; [ $# -ge 1 ] || die "用法: $0 set <${MIN_LIMIT}-${MAX_LIMIT}>"; cmd_set "$1" ;;
+	install)                shift; cmd_install "${1:-$DEFAULT_LIMIT}" ;;
+	uninstall)              shift; cmd_uninstall ;;
+	diagnose)               shift; cmd_diagnose ;;
+	try-now)                shift; cmd_try_now ;;
+	fix-kernel-conflict)    shift; cmd_fix ;;
+	revert-kernel-conflict) shift; cmd_revert ;;
+	help|-h|--help|version|-V) usage ;;
+	*) die "未知命令: ${1} (运行 '$0 help' 查看用法)" ;;
+esac
